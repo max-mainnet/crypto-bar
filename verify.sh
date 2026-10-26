@@ -14,9 +14,16 @@ import sys
 
 project = pathlib.Path(sys.argv[1])
 output = pathlib.Path(sys.argv[2])
-tests = (project / 'Tests/BTCPriceCoreTests/OKXClientTests.swift').read_text()
-tests = tests.replace('import XCTest\n', '').replace('@testable import BTCPriceCore\n', '')
-cases = re.findall(r'    func (test\w+)\(\)( throws)?', tests)
+sources = []
+cases = []
+for path in sorted((project / 'Tests/BTCPriceCoreTests').glob('*.swift')):
+    source = path.read_text().replace('import XCTest\n', '').replace('@testable import BTCPriceCore\n', '')
+    sources.append(source)
+    suites = list(re.finditer(r'(?m)^(?:final\s+)?class\s+(\w+)\s*:\s*XCTestCase\s*\{', source))
+    for index, suite in enumerate(suites):
+        end = suites[index + 1].start() if index + 1 < len(suites) else len(source)
+        for method, throwing in re.findall(r'    func (test\w+)\(\)( throws)?', source[suite.end():end]):
+            cases.append((suite.group(1), method, throwing))
 if not cases:
     raise SystemExit('No core test cases found')
 
@@ -58,6 +65,16 @@ func XCTAssertFalse(_ actual: Bool, file: StaticString = #filePath, line: UInt =
     if actual { fail("Expected false", file: file, line: line) }
 }
 
+func XCTAssertTrue(_ actual: Bool, file: StaticString = #filePath, line: UInt = #line) {
+    assertions += 1
+    if !actual { fail("Expected true", file: file, line: line) }
+}
+
+func XCTAssertNotNil<T>(_ actual: T?, file: StaticString = #filePath, line: UInt = #line) {
+    assertions += 1
+    if actual == nil { fail("Expected non-nil", file: file, line: line) }
+}
+
 func XCTUnwrap<T>(_ value: T?, file: StaticString = #filePath, line: UInt = #line) throws -> T {
     assertions += 1
     guard let value else {
@@ -86,17 +103,19 @@ private func run(_ name: String, _ body: () throws -> Void) {
     if previousFailures == failures { print("PASS \(name)") }
 }
 '''
-runner = '\nlet suite = OKXClientTests()\n'
-runner += '\n'.join(f'run("{name}") {{ {"try " if throwing else ""}suite.{name}() }}' for name, throwing in cases)
+suite_names = list(dict.fromkeys(suite for suite, _, _ in cases))
+variables = {suite: f'suite{index}' for index, suite in enumerate(suite_names)}
+runner = '\n' + '\n'.join(f'let {variables[suite]} = {suite}()' for suite in suite_names) + '\n'
+runner += '\n'.join(f'run("{suite}.{method}") {{ {"try " if throwing else ""}{variables[suite]}.{method}() }}' for suite, method, throwing in cases)
 runner += f'\nprint("\\nStandalone assertion verification: {len(cases)} cases, \\(assertions) assertions, \\(failures) failures.")\n'
 runner += 'exit(failures == 0 ? 0 : 1)\n'
-(output / 'main.swift').write_text(adapter + tests + runner)
+(output / 'main.swift').write_text(adapter + '\n'.join(sources) + runner)
 PYTHON
 
 swiftc \
   -module-cache-path "$CHECK_DIR/module-cache" \
   -target "$(uname -m)-apple-macosx13.0" \
-  "$PROJECT_DIR/Sources/BTCPriceCore/OKXClient.swift" \
+  "$PROJECT_DIR"/Sources/BTCPriceCore/*.swift \
   "$CHECK_DIR/main.swift" \
   -o "$CHECK_DIR/verify-core"
 

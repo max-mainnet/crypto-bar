@@ -7,13 +7,18 @@ final class SymbolPickerWindowController: NSWindowController, NSWindowDelegate,
     private let client = OKXClient()
     private let quoteCurrency: String?
     private let onSelect: (SpotInstrument) -> Void
+    private let onInstrumentsLoaded: (([SpotInstrument]) -> Void)?
+    private let onWatchlistChange: ((SpotInstrument) -> Void)?
     private let searchField = NSSearchField()
+    private let scopeControl = NSSegmentedControl(labels: ["全部现货", "自选列表"],
+                                                  trackingMode: .selectOne, target: nil, action: nil)
     private let table = SymbolPickerTableView()
     private let statusLabel = NSTextField(wrappingLabelWithString: "")
     private let progress = NSProgressIndicator()
     private let refreshButton = NSButton(title: "刷新列表", target: nil, action: nil)
     private let selectButton = NSButton(title: "使用此交易对", target: nil, action: nil)
     private var instruments: [SpotInstrument] = []
+    private var watchlist: [SpotInstrument]
     private var filtered: [SpotInstrument] = []
     private var selectedID: String
     private var loadTask: Task<Void, Never>?
@@ -36,16 +41,22 @@ final class SymbolPickerWindowController: NSWindowController, NSWindowDelegate,
     private var isPresented = false
 
     init(selected: SpotInstrument, quoteCurrency: String? = "USDT",
+         watchlist: [SpotInstrument] = [],
+         onWatchlistChange: ((SpotInstrument) -> Void)? = nil,
+         onInstrumentsLoaded: (([SpotInstrument]) -> Void)? = nil,
          onSelect: @escaping (SpotInstrument) -> Void) {
         let normalizedQuote = quoteCurrency?.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
         self.quoteCurrency = normalizedQuote?.isEmpty == false ? normalizedQuote : nil
         self.selectedID = selected.instId
         self.onSelect = onSelect
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 640, height: 430),
+        self.onInstrumentsLoaded = onInstrumentsLoaded
+        self.onWatchlistChange = onWatchlistChange
+        self.watchlist = Self.uniqueWatchlist(watchlist)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 640, height: 460),
                               styleMask: [.titled, .closable, .resizable],
                               backing: .buffered, defer: false)
         window.title = "选择现货交易对"
-        window.minSize = NSSize(width: 590, height: 390)
+        window.minSize = NSSize(width: 590, height: 420)
         window.isReleasedWhenClosed = false
         super.init(window: window)
         window.delegate = self
@@ -55,10 +66,28 @@ final class SymbolPickerWindowController: NSWindowController, NSWindowDelegate,
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
-    func present(selected: SpotInstrument) {
+    func updateWatchlist(_ instruments: [SpotInstrument]) {
+        let updated = Self.uniqueWatchlist(instruments)
+        guard updated != watchlist else { return }
+        let preservedID = selectedRowInstrument?.instId
+        watchlist = updated
+        let availableIDs = Set(availableInstruments.map(\.instId))
+        prices = prices.filter { availableIDs.contains($0.key) }
+        missingPriceIDs.formIntersection(availableIDs)
+        applyFilter(preferredID: preservedID, selectFirstIfMissing: false, scrollToSelection: false)
+        if availableIDs.contains(where: { prices[$0] == nil }) { refreshPrices() }
+    }
+
+    private static func uniqueWatchlist(_ instruments: [SpotInstrument]) -> [SpotInstrument] {
+        var seen = Set<String>()
+        return instruments.filter { seen.insert($0.instId).inserted }
+    }
+
+    func present(selected: SpotInstrument, showWatchlist: Bool = false) {
         isPresented = true
         selectedID = selected.instId
         searchField.stringValue = ""
+        scopeControl.selectedSegment = showWatchlist ? 1 : 0
         applyFilter(preferredID: selectedID)
         showWindow(nil)
         NSApp.activate(ignoringOtherApps: true)
@@ -84,25 +113,40 @@ final class SymbolPickerWindowController: NSWindowController, NSWindowDelegate,
         refreshButton.bezelStyle = .rounded
         refreshButton.setAccessibilityIdentifier("symbolPicker.refresh")
 
+        scopeControl.selectedSegment = 0
+        scopeControl.segmentStyle = .rounded
+        scopeControl.target = self
+        scopeControl.action = #selector(changeScope)
+        scopeControl.setAccessibilityIdentifier("symbolPicker.scope")
+        scopeControl.setAccessibilityLabel("交易对列表范围")
+
         let description = NSTextField(labelWithString: quoteCurrency.map {
-            "选择 OKX 当前可交易的 \($0) 现货，价格每 30 秒刷新。"
-        } ?? "选择 OKX 当前可交易的现货，价格每 30 秒刷新。")
+            "OKX \($0) 现货 · 点击 ☆ 加入自选 · 价格每 30 秒刷新。"
+        } ?? "OKX 现货 · 点击 ☆ 加入自选 · 价格每 30 秒刷新。")
         description.textColor = .secondaryLabelColor
         description.font = .systemFont(ofSize: 12)
 
+        let favoriteColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("favorite"))
+        favoriteColumn.title = "自选"
+        favoriteColumn.width = 42
+        favoriteColumn.minWidth = 42
+        favoriteColumn.maxWidth = 42
+        favoriteColumn.resizingMask = []
+        favoriteColumn.headerCell.alignment = .center
         let pairColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("pair"))
         pairColumn.title = "交易对"
-        pairColumn.width = 225
+        pairColumn.width = 205
         pairColumn.minWidth = 160
         let baseColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("base"))
         baseColumn.title = "币种"
-        baseColumn.width = 115
+        baseColumn.width = 100
         baseColumn.minWidth = 85
         let priceColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("price"))
         priceColumn.title = "最新价格"
         priceColumn.width = 230
         priceColumn.minWidth = 175
         priceColumn.headerCell.alignment = .right
+        table.addTableColumn(favoriteColumn)
         table.addTableColumn(pairColumn)
         table.addTableColumn(baseColumn)
         table.addTableColumn(priceColumn)
@@ -112,10 +156,11 @@ final class SymbolPickerWindowController: NSWindowController, NSWindowDelegate,
         table.usesAlternatingRowBackgroundColors = true
         table.allowsMultipleSelection = false
         table.allowsEmptySelection = true
+        table.allowsColumnReordering = false
         table.dataSource = self
         table.delegate = self
         table.target = self
-        table.doubleAction = #selector(confirmSelection)
+        table.doubleAction = #selector(confirmDoubleClick)
         table.setAccessibilityIdentifier("symbolPicker.table")
         table.setAccessibilityLabel("OKX 现货交易对搜索结果")
         table.onConfirm = { [weak self] in self?.confirmSelection() }
@@ -164,7 +209,7 @@ final class SymbolPickerWindowController: NSWindowController, NSWindowDelegate,
         buttonRow.spacing = 8
         buttonRow.alignment = .centerY
 
-        let stack = NSStackView(views: [searchRow, description, scroll, statusRow, buttonRow])
+        let stack = NSStackView(views: [searchRow, scopeControl, description, scroll, statusRow, buttonRow])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 11
@@ -214,6 +259,7 @@ final class SymbolPickerWindowController: NSWindowController, NSWindowDelegate,
                       owner.loadGeneration == generation else { return }
                 let preservedID = owner.selectedRowInstrument?.instId ?? owner.selectedID
                 owner.instruments = result
+                owner.onInstrumentsLoaded?(result)
                 owner.isLoading = false
                 owner.loadTask = nil
                 owner.directoryRateLimitCount = 0
@@ -346,8 +392,21 @@ final class SymbolPickerWindowController: NSWindowController, NSWindowDelegate,
     }
 
     private var availableInstruments: [SpotInstrument] {
-        guard let quoteCurrency = quoteCurrency else { return instruments }
-        return instruments.filter { $0.quoteCcy.uppercased() == quoteCurrency }
+        // Keep saved entries manageable even if the latest directory omits them.
+        let combined = Self.uniqueWatchlist(instruments + watchlist)
+        guard let quoteCurrency = quoteCurrency else { return combined }
+        return combined.filter { $0.quoteCcy.uppercased() == quoteCurrency }
+    }
+
+    private var watchlistIDs: Set<String> { Set(watchlist.map(\.instId)) }
+
+    private var isWatchlistScope: Bool { scopeControl.selectedSegment == 1 }
+
+    private var scopedInstruments: [SpotInstrument] {
+        let available = availableInstruments
+        guard isWatchlistScope else { return available }
+        let watched = watchlistIDs
+        return available.filter { watched.contains($0.instId) }
     }
 
     private var selectedRowInstrument: SpotInstrument? {
@@ -355,18 +414,39 @@ final class SymbolPickerWindowController: NSWindowController, NSWindowDelegate,
         return filtered.indices.contains(row) ? filtered[row] : nil
     }
 
-    private func applyFilter(preferredID: String? = nil) {
-        let preservedID = preferredID ?? selectedRowInstrument?.instId ?? selectedID
-        filtered = SpotInstrument.matching(query: searchField.stringValue, in: availableInstruments)
+    private func applyFilter(preferredID: String? = nil, selectFirstIfMissing: Bool = true,
+                             scrollToSelection: Bool = true) {
+        let preservedID = preferredID ?? selectedRowInstrument?.instId
+            ?? (selectFirstIfMissing ? selectedID : nil)
+        filtered = SpotInstrument.matching(query: searchField.stringValue, in: scopedInstruments)
         table.reloadData()
-        if !filtered.isEmpty {
-            let row = filtered.firstIndex(where: { $0.instId == preservedID }) ?? 0
+        if let row = filtered.firstIndex(where: { $0.instId == preservedID }) {
             table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
-            table.scrollRowToVisible(row)
+            if scrollToSelection { table.scrollRowToVisible(row) }
+        } else if selectFirstIfMissing && !filtered.isEmpty {
+            table.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+            if scrollToSelection { table.scrollRowToVisible(0) }
         } else {
             table.deselectAll(nil)
         }
         updateStatus()
+    }
+
+    @objc private func changeScope() {
+        applyFilter(preferredID: selectedRowInstrument?.instId)
+    }
+
+    @objc private func toggleWatchlist(_ sender: WatchlistStarButton) {
+        guard let instrument = availableInstruments.first(where: { $0.instId == sender.instrumentID }) else { return }
+        var updated = watchlist
+        if updated.contains(where: { $0.instId == instrument.instId }) {
+            updated.removeAll { $0.instId == instrument.instId }
+        } else {
+            updated.append(instrument)
+        }
+        // Optimistic UI is reconciled by the app's updateWatchlist callback.
+        updateWatchlist(updated)
+        onWatchlistChange?(instrument)
     }
 
     private func updateStatus() {
@@ -380,7 +460,9 @@ final class SymbolPickerWindowController: NSWindowController, NSWindowDelegate,
             progress.stopAnimation(nil)
         }
         var directoryStatus: String
-        if isLoading {
+        if isWatchlistScope && scopedInstruments.isEmpty {
+            directoryStatus = "自选列表为空，切换到“全部现货”并点击 ☆ 添加。"
+        } else if isLoading {
             directoryStatus = instruments.isEmpty ? "正在从 OKX 加载现货交易对…" : "正在刷新交易对列表 · 已显示 \(filtered.count) 个"
         } else if let error = loadError {
             directoryStatus = "列表加载失败：\(error)"
@@ -388,11 +470,13 @@ final class SymbolPickerWindowController: NSWindowController, NSWindowDelegate,
                 ? " 最早 \(shortTime(nextDirectoryAttempt)) 重试。"
                 : (instruments.isEmpty ? " 请点击“重试”。" : " 仍显示上次列表。")
         } else if filtered.isEmpty {
-            directoryStatus = searchField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            directoryStatus = isWatchlistScope
+                ? "自选中没有匹配的交易对，请调整搜索或切换到“全部现货”。"
+                : searchField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 ? "OKX 暂未返回可用的现货交易对。请刷新列表重试。"
                 : "没有匹配的交易对，请尝试其他币种或完整交易对。"
         } else {
-            directoryStatus = "找到 \(filtered.count) 个交易对 · 双击或按回车选择"
+            directoryStatus = "找到 \(filtered.count) 个\(isWatchlistScope ? "自选" : "交易对") · 双击或按回车选择"
         }
         var priceStatus: [String] = []
         if let error = priceError {
@@ -441,6 +525,25 @@ final class SymbolPickerWindowController: NSWindowController, NSWindowDelegate,
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
         guard filtered.indices.contains(row), let column = tableColumn else { return nil }
         let identifier = NSUserInterfaceItemIdentifier("symbolPicker.\(column.identifier.rawValue)Cell")
+        let instrument = filtered[row]
+        if column.identifier.rawValue == "favorite" {
+            let button = tableView.makeView(withIdentifier: identifier, owner: self) as? WatchlistStarButton
+                ?? WatchlistStarButton(frame: .zero)
+            let watched = watchlistIDs.contains(instrument.instId)
+            button.identifier = identifier
+            button.instrumentID = instrument.instId
+            button.setButtonType(.momentaryChange)
+            button.isBordered = false
+            button.font = .systemFont(ofSize: 20)
+            button.title = watched ? "★" : "☆"
+            button.contentTintColor = watched ? .systemYellow : .secondaryLabelColor
+            button.target = self
+            button.action = #selector(toggleWatchlist(_:))
+            button.toolTip = watched ? "从自选移除 \(instrument.displayName)" : "将 \(instrument.displayName) 加入自选"
+            button.setAccessibilityIdentifier("symbolPicker.favorite.\(instrument.instId)")
+            button.setAccessibilityLabel(button.toolTip)
+            return button
+        }
         let cell: NSTableCellView
         if let reused = tableView.makeView(withIdentifier: identifier, owner: self) as? NSTableCellView {
             cell = reused
@@ -459,7 +562,6 @@ final class SymbolPickerWindowController: NSWindowController, NSWindowDelegate,
                 label.centerYAnchor.constraint(equalTo: cell.centerYAnchor)
             ])
         }
-        let instrument = filtered[row]
         if column.identifier.rawValue == "price" {
             let quote = prices[instrument.instId]
             cell.textField?.font = .monospacedDigitSystemFont(ofSize: 13, weight: .regular)
@@ -478,12 +580,20 @@ final class SymbolPickerWindowController: NSWindowController, NSWindowDelegate,
             cell.textField?.alignment = .left
             cell.textField?.textColor = .labelColor
             cell.textField?.stringValue = column.identifier.rawValue == "pair" ? instrument.displayName : instrument.baseCcy
-            cell.toolTip = nil
+            cell.toolTip = watchlistIDs.contains(instrument.instId)
+                && !instruments.contains(where: { $0.instId == instrument.instId })
+                ? "自选交易对暂未在最新目录中返回，仍可点击 ★ 从自选移除。" : nil
         }
         return cell
     }
 
     func tableViewSelectionDidChange(_ notification: Notification) { updateStatus() }
+
+    @objc private func confirmDoubleClick() {
+        let favoriteColumn = table.column(withIdentifier: NSUserInterfaceItemIdentifier("favorite"))
+        guard table.clickedRow >= 0, table.clickedColumn != favoriteColumn else { return }
+        confirmSelection()
+    }
 
     @objc private func confirmSelection() {
         guard let instrument = selectedRowInstrument else { return }
@@ -516,6 +626,19 @@ private final class SymbolPickerTableView: NSTableView {
     var onConfirm: (() -> Void)?
     var onCancel: (() -> Void)?
 
+    override func mouseDown(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        let column = self.column(at: point)
+        let row = self.row(at: point)
+        if column >= 0, row >= 0, tableColumns[column].identifier.rawValue == "favorite",
+           let button = view(atColumn: column, row: row, makeIfNecessary: true) as? WatchlistStarButton {
+            // Track the control directly so a star click never selects its row.
+            button.mouseDown(with: event)
+            return
+        }
+        super.mouseDown(with: event)
+    }
+
     override func keyDown(with event: NSEvent) {
         switch event.keyCode {
         case 36, 76: onConfirm?()
@@ -523,4 +646,11 @@ private final class SymbolPickerTableView: NSTableView {
         default: super.keyDown(with: event)
         }
     }
+}
+
+@MainActor
+private final class WatchlistStarButton: NSButton {
+    var instrumentID = ""
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 }

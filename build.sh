@@ -14,7 +14,7 @@ for ARCH in arm64 x86_64; do
         -module-cache-path "$BUILD_DIR/ModuleCache" \
         -emit-library -static -emit-module -module-name BTCPriceCore \
         -emit-module-path "$ARCH_DIR/BTCPriceCore.swiftmodule" \
-        "$PROJECT_DIR/Sources/BTCPriceCore/OKXClient.swift" \
+        "$PROJECT_DIR"/Sources/BTCPriceCore/*.swift \
         -o "$ARCH_DIR/libBTCPriceCore.a"
     xcrun swiftc -parse-as-library -O -whole-module-optimization -target "$ARCH-apple-macosx13.0" \
         -module-cache-path "$BUILD_DIR/ModuleCache" \

@@ -32,6 +32,7 @@
 - 行情超过 3 分钟会灰显；旧时间戳响应不会覆盖新行情。
 - HTTP 429 / 接口限流时遵循 `Retry-After` 并自动延迟重试，正常后恢复 30 秒刷新。
 - 请求有超时且不会重叠；休眠期间不请求，不阻止 Mac 正常休眠。
+- 每处只保留一个刷新定时器，重新启动前停止旧定时器；搜索窗口关闭和对象释放时停止定时器并取消请求，已排队的旧回调也会失效。网络等待期间不强持有应用或窗口对象。
 
 ## 公开接口
 
@@ -52,18 +53,21 @@ OKX 没有现货 symbol 模糊查询接口；搜索窗口每次打开时从远�
 需要 macOS 和 Xcode Command Line Tools，无第三方依赖：
 
 ```sh
-chmod +x build.sh verify.sh
+chmod +x build.sh verify.sh verify-lifecycle.sh
 ./build.sh
 open "dist/BTC Price.app"
 ```
 
 同时编译 arm64 / x86_64 并合并为 Universal 应用。可用 `./build.sh /绝对路径/输出目录` 指定输出目录。
 
-验证核心行为：
+验证核心行为和资源生命周期：
 
 ```sh
 ./verify.sh
+./verify-lifecycle.sh
 ```
+
+`verify-lifecycle.sh` 使用本地模拟网络验证定时器替换、窗口关闭、对象释放和请求取消，无需访问 OKX。
 
 安装完整 Xcode 后也可运行标准 XCTest：
 

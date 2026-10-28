@@ -21,8 +21,9 @@ private enum Diagnostics {
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private let menu = NSMenu()
-    private let client = OKXClient()
+    private let client: OKXClient
     private var timer: Timer?
+    private var timerID = UUID()
     private var requestTask: Task<Void, Never>?
     private var requestID = UUID()
     private var quotes: [String: MarketQuote] = [:]
@@ -40,6 +41,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var refreshPending = false
     private var menuIsOpen = false
     private var activity: NSObjectProtocol?
+
+    init(client: OKXClient = OKXClient()) {
+        self.client = client
+        super.init()
+    }
+
+    deinit {
+        timer?.invalidate()
+        requestTask?.cancel()
+        if let activity = activity { ProcessInfo.processInfo.endActivity(activity) }
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         Diagnostics.record("didFinishLaunching")
@@ -107,9 +119,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func startTimer() {
         timer?.invalidate()
+        let id = UUID()
+        timerID = id
         let timer = Timer(timeInterval: OKXClient.refreshInterval, repeats: true) { [weak self] _ in
-            guard let owner = self else { return }
-            Task { @MainActor in owner.refresh() }
+            Task { @MainActor [weak self] in
+                guard let owner = self, owner.timerID == id, owner.timer?.isValid == true else { return }
+                owner.refresh()
+            }
         }
         timer.tolerance = 0.5
         RunLoop.main.add(timer, forMode: .common)
@@ -224,12 +240,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let id = UUID()
         requestID = id
         let requested = instrumentsForQuotes
+        let client = self.client
         render()
         requestTask = Task { [weak self] in
-            guard let self = self else { return }
             do {
-                let result = try await self.client.fetchQuotes(for: requested)
-                guard !Task.isCancelled, self.requestID == id else { return }
+                let result = try await client.fetchQuotes(for: requested)
+                guard !Task.isCancelled, let self = self, self.requestID == id else { return }
                 let currentIDs = Set(self.instrumentsForQuotes.map(\.instId))
                 let requestedIDs = Set(requested.map(\.instId)).intersection(currentIDs)
                 var receivedIDs: Set<String> = []
@@ -243,22 +259,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self.errorMessage = nil
                 self.rateLimitCount = 0
                 self.nextAllowedAttempt = .distantPast
+                self.finishRefresh()
             } catch {
-                guard !Task.isCancelled, self.requestID == id else { return }
+                guard !Task.isCancelled, let self = self, self.requestID == id else { return }
                 self.errorMessage = error.localizedDescription
                 if case PriceError.rateLimited(let retryAfter) = error {
                     self.rateLimitCount += 1
                     let backoff = min(900, 60 * pow(2, Double(min(self.rateLimitCount - 1, 4))))
                     self.nextAllowedAttempt = Date().addingTimeInterval(max(retryAfter, backoff))
                 }
+                self.finishRefresh()
             }
-            self.refreshInProgress = false
-            self.requestTask = nil
-            self.render()
-            let pending = self.refreshPending
-            self.refreshPending = false
-            if pending { self.refresh() }
         }
+    }
+
+    private func finishRefresh() {
+        refreshInProgress = false
+        requestTask = nil
+        render()
+        let pending = refreshPending
+        refreshPending = false
+        if pending { refresh() }
     }
 
     private var isStale: Bool {
@@ -391,10 +412,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         timer?.invalidate()
+        timer = nil
+        requestID = UUID()
         requestTask?.cancel()
+        requestTask = nil
+        refreshInProgress = false
+        refreshPending = false
         symbolPicker?.close()
+        symbolPicker = nil
         NSWorkspace.shared.notificationCenter.removeObserver(self)
         if let activity = activity { ProcessInfo.processInfo.endActivity(activity) }
+        activity = nil
     }
 }
 

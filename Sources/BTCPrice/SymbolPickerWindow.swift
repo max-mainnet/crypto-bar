@@ -4,7 +4,7 @@ import BTCPriceCore
 @MainActor
 final class SymbolPickerWindowController: NSWindowController, NSWindowDelegate,
     NSTableViewDataSource, NSTableViewDelegate, NSSearchFieldDelegate {
-    private let client = OKXClient()
+    private let client: OKXClient
     private let quoteCurrency: String?
     private let onSelect: (SpotInstrument) -> Void
     private let onInstrumentsLoaded: (([SpotInstrument]) -> Void)?
@@ -32,6 +32,7 @@ final class SymbolPickerWindowController: NSWindowController, NSWindowDelegate,
     private var priceTask: Task<Void, Never>?
     private var priceGeneration = 0
     private var priceTimer: Timer?
+    private var priceTimerID = UUID()
     private var isLoadingPrices = false
     private var priceRefreshPending = false
     private var priceError: String?
@@ -44,7 +45,9 @@ final class SymbolPickerWindowController: NSWindowController, NSWindowDelegate,
          watchlist: [SpotInstrument] = [],
          onWatchlistChange: ((SpotInstrument) -> Void)? = nil,
          onInstrumentsLoaded: (([SpotInstrument]) -> Void)? = nil,
+         client: OKXClient = OKXClient(),
          onSelect: @escaping (SpotInstrument) -> Void) {
+        self.client = client
         let normalizedQuote = quoteCurrency?.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
         self.quoteCurrency = normalizedQuote?.isEmpty == false ? normalizedQuote : nil
         self.selectedID = selected.instId
@@ -65,6 +68,12 @@ final class SymbolPickerWindowController: NSWindowController, NSWindowDelegate,
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    deinit {
+        priceTimer?.invalidate()
+        loadTask?.cancel()
+        priceTask?.cancel()
+    }
 
     func updateWatchlist(_ instruments: [SpotInstrument]) {
         let updated = Self.uniqueWatchlist(instruments)
@@ -287,9 +296,13 @@ final class SymbolPickerWindowController: NSWindowController, NSWindowDelegate,
 
     private func startPriceTimer() {
         priceTimer?.invalidate()
+        let id = UUID()
+        priceTimerID = id
         let timer = Timer(timeInterval: OKXClient.refreshInterval, repeats: true) { [weak self] _ in
-            guard let owner = self else { return }
-            Task { @MainActor in owner.priceTimerFired() }
+            Task { @MainActor [weak self] in
+                guard let owner = self, owner.priceTimerID == id, owner.priceTimer?.isValid == true else { return }
+                owner.priceTimerFired()
+            }
         }
         timer.tolerance = 0.5
         RunLoop.main.add(timer, forMode: .common)
